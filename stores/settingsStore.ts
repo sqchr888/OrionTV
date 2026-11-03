@@ -5,6 +5,10 @@ import { storageConfig } from "@/services/storageConfig";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import Logger from "@/utils/Logger";
 
+// 默认后端站点（MoonTV 地址）。构建时改这里即可固化默认 API 地址。
+// 注意：末尾不要带斜杠，saveSettings/loadSettings 会自动规范化。
+const DEFAULT_API_URL = "http://192.168.2.194:3300";
+
 const logger = Logger.withTag('SettingsStore');
 
 // 模块级引用：当前正在进行的 fetchServerConfig Promise。
@@ -44,7 +48,7 @@ interface SettingsState {
 }
 
 export const useSettingsStore = create<SettingsState>((set, get) => ({
-  apiBaseUrl: "",
+  apiBaseUrl: DEFAULT_API_URL,
   m3uUrl: "",
   liveStreamSources: [],
   remoteInputEnabled: false,
@@ -57,8 +61,10 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
   },
   loadSettings: async () => {
     const settings = await SettingsManager.get();
+    // 无存储值时回退到默认站点，并去掉末尾斜杠避免双斜杠
+    const resolvedApiBaseUrl = (settings.apiBaseUrl || DEFAULT_API_URL).replace(/\/$/, "");
     set({
-      apiBaseUrl: settings.apiBaseUrl,
+      apiBaseUrl: resolvedApiBaseUrl,
       m3uUrl: settings.m3uUrl,
       remoteInputEnabled: settings.remoteInputEnabled || false,
       videoSource: settings.videoSource || {
@@ -66,8 +72,9 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
         sources: {},
       },
     });
-    if (settings.apiBaseUrl) {
-      api.setBaseUrl(settings.apiBaseUrl);
+    // 无论是否用户手动配置，都把地址喂给 API 客户端并拉取服务端配置
+    if (resolvedApiBaseUrl) {
+      api.setBaseUrl(resolvedApiBaseUrl);
       await get().fetchServerConfig();
     }
   },
