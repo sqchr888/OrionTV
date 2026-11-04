@@ -25,7 +25,8 @@
           "android": {
             "newArchEnabled": false,
             "enableProguardInReleaseBuilds": true,
-            "enableShrinkResourcesInReleaseBuilds": true
+            "enableShrinkResourcesInReleaseBuilds": true,
+            "usesCleartextTraffic": true
           }
         }
       ],

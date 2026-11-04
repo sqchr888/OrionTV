@@ -15,6 +15,7 @@ import { useUpdateStore, initUpdateStore } from "@/stores/updateStore";
 import { UpdateModal } from "@/components/UpdateModal";
 import { UPDATE_CONFIG } from "@/constants/UpdateConfig";
 import { useResponsiveLayout } from "@/hooks/useResponsiveLayout";
+import adFilterProxy from "@/services/adFilterProxy";
 import Logger from '@/utils/Logger';
 
 const logger = Logger.withTag('RootLayout');
@@ -40,6 +41,12 @@ export default function RootLayout() {
     initializeApp();
     initUpdateStore(); // 初始化更新存储
   }, [loadSettings]);
+
+  // m3u8 广告过滤服务：启动即监听 127.0.0.1:12347（非 Android 内部会自行跳过）
+  useEffect(() => {
+    void adFilterProxy.start();
+    return () => adFilterProxy.stop();
+  }, []);
 
   useEffect(() => {
     if (apiBaseUrl) {

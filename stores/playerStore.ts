@@ -3,6 +3,7 @@ import Toast from "react-native-toast-message";
 import { AVPlaybackStatus, Video } from "expo-av";
 import { RefObject } from "react";
 import { PlayRecord, PlayRecordManager, PlayerSettingsManager } from "@/services/storage";
+import adFilterProxy from "@/services/adFilterProxy";
 import useDetailStore, { episodesSelectorBySource } from "./detailStore";
 import Logger from '@/utils/Logger';
 
@@ -209,7 +210,8 @@ const usePlayerStore = create<PlayerState>((set, get) => ({
       
       const episodesMappingStart = performance.now();
       const mappedEpisodes = episodes.map((ep, index) => ({
-        url: ep,
+        // m3u8 广告过滤：命中 360 源时改写成 127.0.0.1 本地过滤服务地址，失败原样返回
+        url: adFilterProxy.rewritePlaybackUrl(ep, detail!.source, detail!.source_name),
         title: `第 ${index + 1} 集`,
       }));
       const episodesMappingEnd = performance.now();
@@ -512,7 +514,7 @@ const usePlayerStore = create<PlayerState>((set, get) => ({
       const newEpisodes = fallbackSource.episodes || [];
       if (newEpisodes.length > currentEpisodeIndex) {
         const mappedEpisodes = newEpisodes.map((ep, index) => ({
-          url: ep,
+          url: adFilterProxy.rewritePlaybackUrl(ep, fallbackSource.source, fallbackSource.source_name),
           title: `第 ${index + 1} 集`,
         }));
         
