@@ -12,6 +12,8 @@ const logger = Logger.withTag('PlayerStore');
 interface Episode {
   url: string;
   title: string;
+  /** 被改写成本地过滤服务地址时，保留原始上游地址，代理失败时用它重试 */
+  originUrl?: string;
 }
 
 interface PlayerState {
@@ -209,11 +211,24 @@ const usePlayerStore = create<PlayerState>((set, get) => ({
       const savedPlaybackRate = playerSettings?.playbackRate || 1.0;
       
       const episodesMappingStart = performance.now();
-      const mappedEpisodes = episodes.map((ep, index) => ({
+      // 先预热当前集：代理拉不到播放列表时就直连原始地址，绝不让过滤层阻断播放
+      const proxyReady = await adFilterProxy.prewarm(
+        episodes[episodeIndex] || "",
+        detail!.source,
+        detail!.source_name,
+      );
+      const mappedEpisodes = episodes.map((ep, index) => {
         // m3u8 广告过滤：命中 360 源时改写成 127.0.0.1 本地过滤服务地址，失败原样返回
-        url: adFilterProxy.rewritePlaybackUrl(ep, detail!.source, detail!.source_name),
-        title: `第 ${index + 1} 集`,
-      }));
+        const url =
+          index === episodeIndex && !proxyReady
+            ? ep
+            : adFilterProxy.rewritePlaybackUrl(ep, detail!.source, detail!.source_name);
+        return {
+          url,
+          originUrl: url !== ep ? ep : undefined,
+          title: `第 ${index + 1} 集`,
+        };
+      });
       const episodesMappingEnd = performance.now();
       logger.info(`[PERF] Episodes mapping (${episodes.length} episodes) took ${(episodesMappingEnd - episodesMappingStart).toFixed(2)}ms`);
       
@@ -477,14 +492,40 @@ const usePlayerStore = create<PlayerState>((set, get) => ({
     
     const detailStoreState = useDetailStore.getState();
     const { detail } = detailStoreState;
-    const { currentEpisodeIndex } = get();
+    const { currentEpisodeIndex, episodes } = get();
     
     if (!detail) {
       logger.error(`[VIDEO_ERROR] Cannot fallback - no detail available`);
       set({ isLoading: false });
       return;
     }
-    
+
+    // 代理地址失败时，先用原始上游地址重试同一集：
+    // 过滤层（本地服务/端口/URL 编码/上游抓取）任何问题都不该导致整源播放失败
+    const currentEpisode = episodes[currentEpisodeIndex];
+    if (
+      currentEpisode?.originUrl &&
+      failedUrl.startsWith(adFilterProxy.baseUrl) &&
+      currentEpisode.url === failedUrl
+    ) {
+      const retriedEpisodes = episodes.slice();
+      retriedEpisodes[currentEpisodeIndex] = {
+        ...currentEpisode,
+        url: currentEpisode.originUrl,
+        originUrl: undefined,
+      };
+      logger.warn(
+        `[VIDEO_ERROR] Proxy failed, retry original upstream url for episode ${currentEpisodeIndex + 1}`,
+      );
+      set({ episodes: retriedEpisodes, isLoading: true, status: null });
+      Toast.show({
+        type: "info",
+        text1: "已改用原始地址重试",
+        text2: "广告过滤暂时失效，不影响播放",
+      });
+      return;
+    }
+
     // 标记当前source为失败
     const currentSource = detail.source;
     const errorReason = `${errorType} error: ${failedUrl.substring(0, 100)}...`;
@@ -513,10 +554,18 @@ const usePlayerStore = create<PlayerState>((set, get) => ({
       // 重新加载当前集数的episodes
       const newEpisodes = fallbackSource.episodes || [];
       if (newEpisodes.length > currentEpisodeIndex) {
-        const mappedEpisodes = newEpisodes.map((ep, index) => ({
-          url: adFilterProxy.rewritePlaybackUrl(ep, fallbackSource.source, fallbackSource.source_name),
-          title: `第 ${index + 1} 集`,
-        }));
+        const mappedEpisodes = newEpisodes.map((ep, index) => {
+          const url = adFilterProxy.rewritePlaybackUrl(
+            ep,
+            fallbackSource.source,
+            fallbackSource.source_name,
+          );
+          return {
+            url,
+            originUrl: url !== ep ? ep : undefined,
+            title: `第 ${index + 1} 集`,
+          };
+        });
         
         set({
           episodes: mappedEpisodes,

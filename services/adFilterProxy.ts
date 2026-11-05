@@ -40,6 +40,8 @@ export const AD_FILTER_CONFIG = {
   /** R2：分片路径不在本集目录前缀下则删除 */
   strictPathRule: true,
   upstreamTimeoutMs: 8 * 1000,
+  /** 播放前预热超时：超时就先用原始地址播放，不阻塞用户 */
+  prewarmTimeoutMs: 3 * 1000,
   upstreamReferer: 'https://360zy.com/',
   upstreamUserAgent:
     'Mozilla/5.0 (Linux; Android 11) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -48,6 +50,24 @@ export const AD_FILTER_CONFIG = {
 const log = (message: string, ...args: unknown[]) => {
   // eslint-disable-next-line no-console
   console.info(`[adfilter] ${message}`, ...args);
+};
+
+/** UTF-8 字节长度：部分 Hermes 版本没有 TextEncoder，这里做兜底，避免发送前就抛异常 */
+const utf8ByteLength = (text: string): number => {
+  const TextEncoderCtor = (globalThis as { TextEncoder?: new () => { encode(s: string): Uint8Array } })
+    .TextEncoder;
+  if (typeof TextEncoderCtor === 'function') return new TextEncoderCtor().encode(text).length;
+  let bytes = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i);
+    if (code < 0x80) bytes += 1;
+    else if (code < 0x800) bytes += 2;
+    else if (code >= 0xd800 && code <= 0xdbff) {
+      bytes += 4;
+      i += 1;
+    } else bytes += 3;
+  }
+  return bytes;
 };
 
 // ------------------------------------------------------------------ 类型
@@ -473,21 +493,43 @@ class AdFilterProxyService {
     }, headOnly);
   }
 
-  private async getFiltered(url: string): Promise<PlaylistResult> {
+  /**
+   * 播放前预热：确认代理链路真的能拿到播放列表。
+   * 返回 false 表示"这条集数不要走代理"（直接播原始地址），从根上避免代理把播放卡死。
+   * 成功时顺带把结果写入缓存，播放器随后请求几乎是瞬时的。
+   */
+  public async prewarm(url: string, source?: string, sourceName?: string): Promise<boolean> {
+    try {
+      if (!AD_FILTER_CONFIG.enabled || !this.running) return false;
+      if (!url || !this.shouldFilter(url, source, sourceName)) return true;
+      const result = await this.getFiltered(url, AD_FILTER_CONFIG.prewarmTimeoutMs);
+      if (result.kind !== 'ok') log(`prewarm miss, play raw ${hostOf(url)}`);
+      return result.kind === 'ok';
+    } catch (error) {
+      log('prewarm failed:', (error as Error).message);
+      return false;
+    }
+  }
+
+  private async getFiltered(
+    url: string,
+    timeoutMs = AD_FILTER_CONFIG.upstreamTimeoutMs,
+  ): Promise<PlaylistResult> {
     const now = Date.now();
     const hit = this.cache.get(url);
     if (hit && now - hit.at < AD_FILTER_CONFIG.cacheTtlMs) {
       return { kind: 'ok', text: hit.text, stats: hit.stats, cached: true };
     }
 
-    const outcome = await this.fetchPlaylist(url);
+    const outcome = await this.fetchPlaylist(url, timeoutMs);
     if (!outcome.ok) {
       const previous = this.stale.get(url);
       if (previous) {
         log(`upstream failed (${outcome.reason}), reuse stale ${hostOf(url)}`);
         return { kind: 'ok', text: previous.text, stats: previous.stats, cached: true };
       }
-      log(`upstream failed (${outcome.reason}), passthrough ${hostOf(url)}`);
+      // 打完整地址，方便用 adb logcat 抓出来在浏览器里直接对照上游是否可用
+      log(`upstream failed (${outcome.reason}), passthrough ${hostOf(url)} url=${url}`);
       return { kind: 'redirect', reason: outcome.reason };
     }
 
@@ -524,47 +566,87 @@ class AdFilterProxyService {
   }
 
   /** 同一 URL 的并发请求共享一次上游抓取 */
-  private fetchPlaylist(url: string): Promise<FetchOutcome> {
+  private fetchPlaylist(url: string, timeoutMs: number): Promise<FetchOutcome> {
     const existing = this.inflight.get(url);
     if (existing) return existing;
-    const task = this.doFetch(url).finally(() => {
+    const task = this.doFetch(url, timeoutMs).finally(() => {
       this.inflight.delete(url);
     });
     this.inflight.set(url, task);
     return task;
   }
 
-  private async doFetch(url: string): Promise<FetchOutcome> {
+  private async doFetch(url: string, timeoutMs: number): Promise<FetchOutcome> {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), AD_FILTER_CONFIG.upstreamTimeoutMs);
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const response = await fetch(url, {
-        signal: controller.signal,
-        headers: {
+      // 有些 CDN 对陌生 Referer 直接 403，带 Referer 失败时再裸请求一次
+      const attempts: Record<string, string>[] = [
+        {
           'User-Agent': AD_FILTER_CONFIG.upstreamUserAgent,
           Referer: AD_FILTER_CONFIG.upstreamReferer,
           Accept: '*/*',
         },
-      });
-      if (!response.ok) {
-        return { ok: false, reason: `http ${response.status}` };
+        { 'User-Agent': AD_FILTER_CONFIG.upstreamUserAgent, Accept: '*/*' },
+      ];
+      let lastReason = 'unknown';
+      for (const headers of attempts) {
+        try {
+          const response = await fetch(url, { signal: controller.signal, headers });
+          if (!response.ok) {
+            lastReason = `http ${response.status}`;
+            continue;
+          }
+          const text = await response.text();
+          if (!text.trim().startsWith('#EXTM3U')) {
+            lastReason = 'not a playlist';
+            continue;
+          }
+          // RN 的 fetch 通常能给出跟随重定向后的地址；拿不到时退回原始地址
+          const finalUrl = ((response as unknown as { url?: string }).url || url).trim() || url;
+          return { ok: true, finalUrl, text };
+        } catch (error) {
+          lastReason =
+            (error as Error).name === 'AbortError' || controller.signal.aborted
+              ? 'timeout'
+              : (error as Error).message;
+        }
       }
-      const text = await response.text();
-      if (!text.trim().startsWith('#EXTM3U')) {
-        return { ok: false, reason: 'not a playlist' };
-      }
-      // RN 的 fetch 通常能给出跟随重定向后的地址；拿不到时退回原始地址
-      const finalUrl = ((response as unknown as { url?: string }).url || url).trim() || url;
-      return { ok: true, finalUrl, text };
-    } catch (error) {
-      const reason = (error as Error).name === 'AbortError' ? 'timeout' : (error as Error).message;
-      return { ok: false, reason: `fetch failed: ${reason}` };
+      return { ok: false, reason: lastReason };
     } finally {
       clearTimeout(timer);
     }
   }
 
   // -- 响应 --
+
+  /**
+   * 关键修复：react-native-tcp-socket 的 end() 是在另一个执行器上直接 close socket 的，
+   * 而 write() 是排队到 per-socket 写线程里异步执行的。write 之后立刻 end 存在竞态，
+   * socket 可能先被 close，导致 ExoPlayer 收到空响应/半截响应 -> 整源播放失败。
+   * 必须等 write 回调（native 写完）之后再 end。
+   */
+  private writeThenEnd(socket: TcpSocket.Socket, payload: string): void {
+    let finished = false;
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      try {
+        socket.end();
+      } catch (error) {
+        log('end failed:', (error as Error).message);
+      }
+    };
+    try {
+      socket.write(payload, 'utf8', finish);
+    } catch (error) {
+      log('write failed:', (error as Error).message);
+      finish();
+      return;
+    }
+    // 某些实现可能不回调：1s 后强制关闭，避免播放器请求悬挂
+    setTimeout(finish, 1000);
+  }
 
   private send(
     socket: TcpSocket.Socket,
@@ -574,7 +656,7 @@ class AdFilterProxyService {
     extra: Record<string, string> = {},
     headOnly = false,
   ): void {
-    const bytes = new TextEncoder().encode(body).length;
+    const bytes = utf8ByteLength(body);
     let head = `HTTP/1.1 ${status} ${STATUS_TEXT[status] || 'OK'}\r\n`;
     head += `Content-Type: ${contentType}\r\n`;
     head += `Content-Length: ${bytes}\r\n`;
@@ -584,12 +666,7 @@ class AdFilterProxyService {
     for (const [key, value] of Object.entries(extra)) head += `${key}: ${value}\r\n`;
     head += '\r\n';
 
-    try {
-      socket.write(headOnly ? head : head + body);
-    } catch (error) {
-      log('write failed:', (error as Error).message);
-    }
-    socket.end();
+    this.writeThenEnd(socket, headOnly ? head : head + body);
   }
 
   private sendRedirect(socket: TcpSocket.Socket, location: string, reason: string): void {
@@ -600,12 +677,7 @@ class AdFilterProxyService {
     head += `X-ADFilter-Fallback: ${reason.replace(/[\r\n]/g, ' ')}\r\n`;
     head += '\r\n';
 
-    try {
-      socket.write(head);
-    } catch (error) {
-      log('write failed:', (error as Error).message);
-    }
-    socket.end();
+    this.writeThenEnd(socket, head);
   }
 }
 
