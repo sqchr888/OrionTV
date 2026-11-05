@@ -71,6 +71,9 @@ export const useVideoHandlers = ({
     const isNetworkError = errorString.includes('HttpDataSourceException') ||
                          errorString.includes('IOException') ||
                          errorString.includes('SocketTimeoutException');
+    // 硬解码器错误（如 OMX.MS.AVC.Decoder failed）：与网络/代理无关，
+    // 不能当成"代理失败"回退原始地址，否则过滤失效、广告重新出现
+    const isDecoderError = /decoder|mediacodec|codec/i.test(errorString);
     
     if (isSSLError) {
       console.error(`[SSL_ERROR] SSL certificate validation failed for URL: ${currentEpisode.url}`);
@@ -80,6 +83,14 @@ export const useVideoHandlers = ({
         text2: "请稍候"
       });
       usePlayerStore.getState().handleVideoError('ssl', currentEpisode.url);
+    } else if (isDecoderError) {
+      console.warn(`[DECODER_ERROR] Decoder failed for URL: ${currentEpisode.url}`);
+      Toast.show({
+        type: "info",
+        text1: "解码异常，正在重试",
+        text2: "如仍失败将自动切换播放源"
+      });
+      usePlayerStore.getState().handleVideoError('decoder', currentEpisode.url);
     } else if (isNetworkError) {
       console.error(`[NETWORK_ERROR] Network connection failed for URL: ${currentEpisode.url}`);
       Toast.show({ 

@@ -60,7 +60,7 @@ interface PlayerState {
   _isRecordSaveThrottled: boolean;
   // Internal helper
   _savePlayRecord: (updates?: Partial<PlayRecord>, options?: { immediate?: boolean }) => void;
-  handleVideoError: (errorType: 'ssl' | 'network' | 'other', failedUrl: string) => Promise<void>;
+  handleVideoError: (errorType: 'ssl' | 'network' | 'other' | 'decoder', failedUrl: string) => Promise<void>;
 }
 
 const usePlayerStore = create<PlayerState>((set, get) => ({
@@ -486,7 +486,7 @@ const usePlayerStore = create<PlayerState>((set, get) => ({
     });
   },
 
-  handleVideoError: async (errorType: 'ssl' | 'network' | 'other', failedUrl: string) => {
+  handleVideoError: async (errorType: 'ssl' | 'network' | 'other' | 'decoder', failedUrl: string) => {
     const perfStart = performance.now();
     logger.error(`[VIDEO_ERROR] Handling ${errorType} error for URL: ${failedUrl}`);
     
@@ -500,10 +500,35 @@ const usePlayerStore = create<PlayerState>((set, get) => ({
       return;
     }
 
+    const currentEpisode = episodes[currentEpisodeIndex];
+
+    // 解码器错误（MediaCodec/OMX 失败）与过滤层无关，回退原始地址只会把广告放回来。
+    // 先原地重载同一代理地址一次（加 r=1 让 expo-av 认为地址变化从而重新加载），
+    // 已重载仍然失败才继续走下面的切源逻辑。
+    if (
+      errorType === 'decoder' &&
+      currentEpisode?.url &&
+      currentEpisode.url.startsWith(adFilterProxy.baseUrl) &&
+      currentEpisode.url === failedUrl &&
+      !/[?&]r=1(?:&|$)/.test(currentEpisode.url)
+    ) {
+      const retriedEpisodes = episodes.slice();
+      const baseUrl = currentEpisode.url;
+      retriedEpisodes[currentEpisodeIndex] = {
+        ...currentEpisode,
+        url: `${baseUrl}${baseUrl.includes('?') ? '&' : '?'}r=1`,
+      };
+      logger.warn(
+        `[VIDEO_ERROR] Decoder error, reload proxy url once for episode ${currentEpisodeIndex + 1}`,
+      );
+      set({ episodes: retriedEpisodes, isLoading: true, status: null });
+      return;
+    }
+
     // 代理地址失败时，先用原始上游地址重试同一集：
     // 过滤层（本地服务/端口/URL 编码/上游抓取）任何问题都不该导致整源播放失败
-    const currentEpisode = episodes[currentEpisodeIndex];
     if (
+      errorType !== 'decoder' &&
       currentEpisode?.originUrl &&
       failedUrl.startsWith(adFilterProxy.baseUrl) &&
       currentEpisode.url === failedUrl

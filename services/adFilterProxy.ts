@@ -244,7 +244,10 @@ export const filterPlaylist = (text: string, playlistUrl: string): FilterResult 
         stats.blocks += 1;
         continue;
       }
-      const keepDiscontinuity = pendingDiscontinuity && !inAd;
+      // 广告块之后紧跟的 #EXT-X-DISCONTINUITY 必须保留：
+      // 此时 inAd 仍为 true，若用 !inAd 判断会把交界标签丢掉，
+      // 过滤后的时间轴缺少不连续点，硬解码器容易报 OMX.MS.AVC.Decoder 失败。
+      const keepDiscontinuity = pendingDiscontinuity;
       inAd = false;
       if (keepDiscontinuity) out.push('#EXT-X-DISCONTINUITY');
       pendingDiscontinuity = false;
