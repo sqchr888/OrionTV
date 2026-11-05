@@ -24,7 +24,8 @@ import TcpSocket from 'react-native-tcp-socket';
 
 /** 过滤开关与参数：需要临时关掉过滤时，把 enabled 改成 false 重新打包即可 */
 export const AD_FILTER_CONFIG = {
-  enabled: true,
+  // AB 对照临时关闭：验证卡顿是否与过滤链路相关，验证后恢复 true
+  enabled: false,
   port: 12347,
   /**
    * 只对这些源生效：命中 source(resource.key) 或 source_name 的子串。
